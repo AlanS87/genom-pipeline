@@ -51,12 +51,12 @@ def run_pipeline(
 
     # Step 1
     if _should_run(concept_store_pt, overwrite):
-        from github.genom_pipeline.steps.extract import run as step1_extract
+        from genom_pipeline.steps.extract import run as step1_extract
         step1_extract(src_onto_path, tgt_onto_path, str(concept_store_pt))
 
     # Step 2
     if run_definition:
-        from github.genom_pipeline.steps.define import run as step2_define
+        from genom_pipeline.steps.define import run as step2_define
         step2_define(
             store_pt_path=str(concept_store_pt),
             llm_model=llm_model,
@@ -65,7 +65,7 @@ def run_pipeline(
         )
 
     # Step 3
-    from github.genom_pipeline.steps.embed import run as step3_embed
+    from genom_pipeline.steps.embed import run as step3_embed
     step3_embed(
         store_pt_path=str(concept_store_pt),
         embedding_model=embedding_model,
@@ -75,7 +75,7 @@ def run_pipeline(
 
     # Step 4
     if _should_run(candidates_csv, overwrite):
-        from github.genom_pipeline.steps.retrieve import run as step4_retrieve
+        from genom_pipeline.steps.retrieve import run as step4_retrieve
         step4_retrieve(
             store_pt_path=str(concept_store_pt),
             output_candidates_csv=str(candidates_csv),
@@ -86,7 +86,7 @@ def run_pipeline(
 
     # Step 5
     if _should_run(llm_alignment_csv, overwrite):
-        from github.genom_pipeline.steps.judge import run as step5_judge
+        from genom_pipeline.steps.judge import run as step5_judge
         step5_judge(
             store_pt_path=str(concept_store_pt),
             candidates_csv=str(candidates_csv),
@@ -98,7 +98,7 @@ def run_pipeline(
 
     # Step 6
     if _should_run(final_alignment_csv, overwrite):
-        from github.genom_pipeline.steps.fusion import run as step6_fuse
+        from genom_pipeline.steps.fusion import run as step6_fuse
         step6_fuse(
             store_pt_path=str(concept_store_pt),
             llm_alignment_csv=str(llm_alignment_csv),

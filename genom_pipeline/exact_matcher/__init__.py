@@ -5,11 +5,15 @@ from typing import Any, Dict
 from .base import MatcherResult, MappingTuple
 from .bertmaplt_string import BERTMapLtStringMatcher
 from .logmaplt_file import LogMapLtFileMatcher
+from .logmaplt_subprocess import LogMapLtSubprocessMatcher
 
 
 _MATCHERS = {
     "bertmaplt_string": BERTMapLtStringMatcher(),
+    # loads a mapping TSV produced by some earlier, separate LogMap run
     "logmaplt_file": LogMapLtFileMatcher(),
+    # actually invokes the LogMap jar (see scripts/download_logmap.sh)
+    "logmaplt_subprocess": LogMapLtSubprocessMatcher(),
 }
 
 

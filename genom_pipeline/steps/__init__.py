@@ -5,4 +5,4 @@ from .retrieve import run as retrieve
 from .judge import run as judge
 from .fusion import run as fuse
 
-__all__ = ["extract", "define", "embed", "retrieve", "judge", "fusion"]
+__all__ = ["extract", "define", "embed", "retrieve", "judge", "fuse"]

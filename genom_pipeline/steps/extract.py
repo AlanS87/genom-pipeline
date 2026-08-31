@@ -6,6 +6,13 @@ import torch
 from deeponto.onto import Ontology, OntologyVerbaliser, OntologyReasoner
 from deeponto.align.bertmap import BERTMapPipeline
 
+from genom_pipeline import _deeponto_compat
+
+# DeepOnto's verbaliser doesn't support the OWL DataHasValue restriction
+# (used by real ontologies such as SNOMED-CT) and crashes on it. See
+# _deeponto_compat.py for why this is needed and what it trades off.
+_deeponto_compat.apply()
+
 
 def truncate_labels(labels: List[str], cut_off: int = 3) -> List[str]:
     """Prevent token overflow by keeping the longest labels."""

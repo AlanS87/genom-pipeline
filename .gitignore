@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Pipeline outputs / experiment artifacts
+runs/
+checkpoints/
+*.pt
+
+# Third-party binaries fetched at setup time (see scripts/download_logmap.sh)
+.cache/
+logmap_lite_output/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
