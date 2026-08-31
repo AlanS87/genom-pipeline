@@ -28,11 +28,65 @@ a substitute for a real fix upstream.
 
 extract.py calls apply() once, at import time, before any verbalisation
 happens.
+
+This module also starts DeepOnto's JVM as a side effect of being imported,
+before it does anything else -- see _init_jvm() below for why that has to
+happen here specifically.
 """
 
+import os
 import warnings
 
-from deeponto.onto.verbalisation import OntologySyntaxParser
+import jpype
+
+import deeponto
+
+_DEFAULT_JVM_MEMORY = "8g"
+
+
+def _init_jvm() -> None:
+    """
+    Start the JVM DeepOnto needs (via jpype) before anything imports
+    deeponto.onto.
+
+    deeponto/onto/ontology.py runs this at *module import time*:
+
+        if not jpype.isJVMStarted():
+            memory = click.prompt("Please enter the maximum memory located "
+                                   "to JVM", type=str, default="8g")
+            init_jvm(memory)
+
+    i.e. the first time anything anywhere imports deeponto.onto (directly,
+    or transitively -- e.g. via deeponto.align.bertmap), DeepOnto blocks on
+    an interactive prompt asking how much memory to give the JVM, unless
+    the JVM is already started. In any non-interactive context (CI, a
+    plain script, pytest with output captured) there's no terminal to
+    answer that prompt -- under pytest specifically this fails hard with
+    `OSError: reading from stdin while output is captured!` and aborts
+    test collection entirely (this is exactly what broke the first real
+    CI run: every test module that imports deeponto, directly or
+    transitively, errored out with this).
+
+    Calling deeponto.init_jvm() ourselves here -- before any deeponto.onto
+    import anywhere in genom_pipeline -- makes `jpype.isJVMStarted()` true
+    by the time deeponto/onto/ontology.py's module-level check runs, so it
+    skips the prompt entirely. Idempotent: jpype only allows starting the
+    JVM once per process, so this is a no-op on any call after the first
+    (including a call made from a different module that also imports
+    _deeponto_compat).
+
+    Memory limit is controlled by the GENOM_JVM_MEMORY environment
+    variable; defaults to "8g" to match DeepOnto's own default.
+    """
+    if jpype.isJVMStarted():
+        return
+    memory = os.environ.get("GENOM_JVM_MEMORY", _DEFAULT_JVM_MEMORY)
+    deeponto.init_jvm(memory)
+
+
+_init_jvm()
+
+from deeponto.onto.verbalisation import OntologySyntaxParser  # noqa: E402  (must come after _init_jvm())
 
 _TARGET = "DataHasValue"
 

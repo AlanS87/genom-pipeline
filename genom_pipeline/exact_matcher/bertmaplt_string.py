@@ -5,6 +5,11 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, List, Set, Tuple
 
+# Must be imported before any `deeponto` import below -- see
+# _deeponto_compat.py's _init_jvm() for why (starts the JVM non-
+# interactively so DeepOnto doesn't block on a stdin prompt).
+from genom_pipeline import _deeponto_compat  # noqa: F401
+
 from deeponto.utils import Tokenizer
 from deeponto.onto import Ontology
 from deeponto.align.bertmap import BERTMapPipeline

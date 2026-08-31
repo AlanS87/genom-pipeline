@@ -3,10 +3,14 @@ from __future__ import annotations
 from typing import Any, Dict, List
 import torch
 
+# Must be imported before any `deeponto.onto` import (this one included) --
+# importing it starts DeepOnto's JVM non-interactively (see
+# _deeponto_compat.py's _init_jvm()) so DeepOnto doesn't block on its
+# "how much memory for the JVM?" prompt the moment deeponto.onto loads.
+from genom_pipeline import _deeponto_compat
+
 from deeponto.onto import Ontology, OntologyVerbaliser, OntologyReasoner
 from deeponto.align.bertmap import BERTMapPipeline
-
-from genom_pipeline import _deeponto_compat
 
 # DeepOnto's verbaliser doesn't support the OWL DataHasValue restriction
 # (used by real ontologies such as SNOMED-CT) and crashes on it. See

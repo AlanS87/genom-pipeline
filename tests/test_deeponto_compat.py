@@ -9,9 +9,14 @@ from __future__ import annotations
 import warnings
 
 import pytest
-from deeponto.onto.verbalisation import OntologySyntaxParser
 
+# Must be imported before any `deeponto.onto` import below -- importing it
+# starts DeepOnto's JVM non-interactively (see _deeponto_compat.py's
+# _init_jvm()), otherwise deeponto.onto blocks on a stdin prompt the moment
+# it's imported, which pytest turns into a hard collection error.
 from genom_pipeline import _deeponto_compat
+
+from deeponto.onto.verbalisation import OntologySyntaxParser
 
 
 @pytest.fixture(autouse=True)
@@ -85,3 +90,40 @@ def test_patched_parse_leaves_normal_expressions_untouched(monkeypatch):
         OntologySyntaxParser.parse(dummy, "ObjectIntersectionOf(A B)")
 
     assert calls == ["ObjectIntersectionOf(A B)"]
+
+
+def test_init_jvm_skips_when_already_started(monkeypatch):
+    # Regression case for the CI break: deeponto.onto's module-level code
+    # calls click.prompt(...) for JVM memory unless jpype.isJVMStarted() is
+    # already True. If the JVM is (or claims to be) started, we must not
+    # call deeponto.init_jvm() again -- jpype only allows starting it once
+    # per process.
+    monkeypatch.setattr(_deeponto_compat.jpype, "isJVMStarted", lambda: True)
+    calls = []
+    monkeypatch.setattr(_deeponto_compat.deeponto, "init_jvm", lambda memory: calls.append(memory))
+
+    _deeponto_compat._init_jvm()
+
+    assert calls == []
+
+
+def test_init_jvm_starts_with_default_memory(monkeypatch):
+    monkeypatch.setattr(_deeponto_compat.jpype, "isJVMStarted", lambda: False)
+    monkeypatch.delenv("GENOM_JVM_MEMORY", raising=False)
+    calls = []
+    monkeypatch.setattr(_deeponto_compat.deeponto, "init_jvm", lambda memory: calls.append(memory))
+
+    _deeponto_compat._init_jvm()
+
+    assert calls == [_deeponto_compat._DEFAULT_JVM_MEMORY]
+
+
+def test_init_jvm_respects_env_override(monkeypatch):
+    monkeypatch.setattr(_deeponto_compat.jpype, "isJVMStarted", lambda: False)
+    monkeypatch.setenv("GENOM_JVM_MEMORY", "2g")
+    calls = []
+    monkeypatch.setattr(_deeponto_compat.deeponto, "init_jvm", lambda memory: calls.append(memory))
+
+    _deeponto_compat._init_jvm()
+
+    assert calls == ["2g"]
