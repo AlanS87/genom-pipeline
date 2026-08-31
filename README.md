@@ -2,12 +2,14 @@
 
 This repository contains the official implementation of:
 
-> **GenOM: Ontology Matching with Description Generation and Large Language Models** (under review)
+> **GenOM: Ontology Matching with Description Generation and Large Language Models**
+> Published in *World Wide Web* (Springer), 2026.
 
 GenOM is an ontology matching framework that improves alignment performance through **LLM-based semantic enrichment**, particularly via definition generation.
 
 Paper:
-https://arxiv.org/abs/2508.10703
+- Published version (open access): https://doi.org/10.1007/s11280-026-01413-y
+- Preprint: https://arxiv.org/abs/2508.10703
 
 ---
 
@@ -299,12 +301,22 @@ A single task is used for threshold selection, and the same thresholds are appli
 
 ## Citation
 
-    @article{song2025genom,
-        title={GenOM: Ontology Matching with Description Generation and Large Language Model},
-        author={Song, Yiping and Chen, Jiaoyan and Schmidt, Renate A},
-        journal={arXiv preprint arXiv:2508.10703},
-        year={2025}
+If you use this repository, please cite the published version:
+
+    @article{song2026genom,
+        title={GenOM: ontology matching with description generation and large language models},
+        author={Song, Yiping and Chen, Jiaoyan and Schmidt, Renate A.},
+        journal={World Wide Web},
+        volume={29},
+        number={3},
+        articleno={29},
+        year={2026},
+        publisher={Springer},
+        doi={10.1007/s11280-026-01413-y}
     }
+
+A preprint version is also available on arXiv (arXiv:2508.10703); the published
+version above is the canonical, peer-reviewed reference.
 
 ---
 
