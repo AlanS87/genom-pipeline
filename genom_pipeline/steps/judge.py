@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -145,6 +146,18 @@ def _score_batch(judge: HFYesNoJudge, prompts: List[str]) -> List[float]:
     return conf
 
 
+def _atomic_write_csv(df: pd.DataFrame, path: str) -> None:
+    """
+    Same rationale as define.py's _atomic_torch_save: a plain df.to_csv(path)
+    that gets killed mid-write (SLURM walltime, OOM, node failure) leaves a
+    truncated CSV at `path`. Writing to a sibling temp file and os.replace()-
+    ing it in is atomic on POSIX filesystems.
+    """
+    tmp_path = f"{path}.tmp"
+    df.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, path)
+
+
 def run(
     store_pt_path: str,
     candidates_csv: str,
@@ -172,6 +185,13 @@ def run(
       torch_dtype: str default "bfloat16"
       device_map: str default "auto"
       threshold: float default 0.5
+      checkpoint_every_n_batches: int default 50 -- progress is written to
+          a checkpoint CSV (under checkpoint_dir) after this many batches,
+          so a killed/timed-out job resumes from there instead of losing
+          everything back to the previous full run (previously this
+          function only wrote output_alignment_csv once, at the very end).
+      checkpoint_dir: Optional[str] default dirname(output_alignment_csv)/
+          "checkpoints" -- same convention as embed.py's checkpoint_dir.
 
     Returns
       output_alignment_csv
@@ -201,16 +221,47 @@ def run(
     device_map = llm_config.get("device_map", "auto")
     hf_token = llm_config.get("hf_token")
     threshold = float(llm_config.get("threshold", 0.5))
+    checkpoint_every_n_batches = int(llm_config.get("checkpoint_every_n_batches", 50))
+
+    checkpoint_dir = Path(llm_config.get("checkpoint_dir", str(Path(out_path).parent / "checkpoints")))
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = str(checkpoint_dir / f"{Path(out_path).stem}_judge_checkpoint.csv")
+
+    # confidence starts as NaN (not 0.0) so "still NaN" unambiguously means
+    # "not judged yet" -- 0.0 is itself a legitimate confidence score, so it
+    # can't double as the not-done-yet sentinel a resume needs.
+    resumed = False
+    if os.path.exists(checkpoint_path) and not overwrite:
+        checkpoint_df = pd.read_csv(checkpoint_path)
+        same_rows = (
+            len(checkpoint_df) == len(df)
+            and list(checkpoint_df["src_iri"]) == list(df["src_iri"])
+            and list(checkpoint_df["tgt_iri"]) == list(df["tgt_iri"])
+        )
+        if same_rows:
+            df = checkpoint_df
+            resumed = True
+    if not resumed:
+        df["confidence"] = float("nan")
+        df["decision"] = pd.NA
 
     judge = _load_judge_model(llm_model, hf_token=hf_token, torch_dtype=torch_dtype, device_map=device_map)
 
-    df["confidence"] = 0.0
-    df["decision"] = "NO"
-
     prompts: List[str] = []
     row_ids: List[int] = []
+    batches_since_checkpoint = 0
+
+    def _score_and_fill(ids_batch: List[int], prompts_batch: List[str]) -> None:
+        confs = _score_batch(judge, prompts_batch)
+        for j, c in enumerate(confs):
+            c2 = float(round(c, 6))
+            df.at[ids_batch[j], "confidence"] = c2
+            df.at[ids_batch[j], "decision"] = "YES" if c2 >= threshold else "NO"
 
     for ridx, row in tqdm(df.iterrows(), total=len(df), desc="LLM judging"):
+        if pd.notna(row.get("confidence")):
+            continue  # already scored in a previous, interrupted run
+
         src_iri = row["src_iri"]
         tgt_iri = row["tgt_iri"]
 
@@ -235,24 +286,26 @@ def run(
         row_ids.append(ridx)
 
         if len(prompts) >= batch_size:
-            confs = _score_batch(judge, prompts)
-            for j, c in enumerate(confs):
-                c2 = float(round(c, 6))
-                df.at[row_ids[j], "confidence"] = c2
-                df.at[row_ids[j], "decision"] = "YES" if c2 >= threshold else "NO"
+            _score_and_fill(row_ids, prompts)
             prompts.clear()
             row_ids.clear()
+            batches_since_checkpoint += 1
+            if batches_since_checkpoint >= checkpoint_every_n_batches:
+                _atomic_write_csv(df, checkpoint_path)
+                batches_since_checkpoint = 0
 
     if prompts:
-        confs = _score_batch(judge, prompts)
-        for j, c in enumerate(confs):
-            c2 = float(round(c, 6))
-            df.at[row_ids[j], "confidence"] = c2
-            df.at[row_ids[j], "decision"] = "YES" if c2 >= threshold else "NO"
+        _score_and_fill(row_ids, prompts)
 
     df["llm_model"] = llm_model
     df["input_fields"] = ",".join(input_fields)
-    df.to_csv(out_path, index=False)
+    _atomic_write_csv(df, out_path)
+
+    # The real output now exists and is complete -- drop the checkpoint so a
+    # later overwrite=True re-run never mistakes a stale, differently-sized
+    # checkpoint for something it can resume from.
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
 
     store.setdefault("meta", {})
     store["meta"]["judge_model"] = llm_model
