@@ -31,11 +31,26 @@ happens.
 
 This module also starts DeepOnto's JVM as a side effect of being imported,
 before it does anything else -- see _init_jvm() below for why that has to
-happen here specifically. It also hardens JPype's global import hook
-against a real segfault seen on CSF3 -- see _harden_jpype_import_hook()
-below for why that's needed and why "start the JVM before importing your
-own heavy dependencies" (an earlier, incomplete fix) doesn't actually solve
-this.
+happen here specifically. It also works around two independent, real
+segfaults seen on CSF3 when running this project's JVM (via JPype) in the
+same process as CUDA (via torch):
+
+  1. _harden_jpype_import_hook() -- JPype's global import hook can
+     segfault when asked whether an ordinary (non-Java) Python package is
+     secretly a Java package. See that function's docstring.
+  2. _init_jvm() starts the JVM with the extra "-Xrs" flag -- a segfault
+     was also observed inside JPype's handling of a genuinely-needed Java
+     import (`from java.io import File`) itself, which pointed at a
+     second, independent cause: HotSpot JVMs install their own SIGSEGV/
+     SIGBUS/etc. handlers by default, which is a known source of crashes
+     when another native library in the same process (here, CUDA, via
+     torch) also relies on signal handling. See _JVM_EXTRA_ARGS below.
+
+Neither of these has been confirmed to fix the crash in the environment
+that actually exhibits it -- this codebase's own sandbox has never
+reproduced it -- but both target real, documented mechanisms, and are
+kept together because they are independent (removing one doesn't affect
+the other).
 """
 
 import os
@@ -47,6 +62,29 @@ import jpype.imports  # registers jpype's global import hook as a side effect
 import deeponto
 
 _DEFAULT_JVM_MEMORY = "8g"
+
+# Extra flags passed to jpype.startJVM() beyond what deeponto.init_jvm()
+# itself uses (just "-ea" and "-Xmx<memory>"). "-Xrs" ("reduce use of OS
+# signals") tells the JVM not to install its own handlers for SIGSEGV,
+# SIGBUS, SIGQUIT, SIGHUP and SIGTERM. By default, HotSpot JVMs install a
+# SIGSEGV/SIGBUS handler as a JIT optimisation (implicit null-pointer
+# checks: dereference-and-recover-in-the-handler instead of an explicit
+# branch) and handlers for the other three for diagnostics (thread dumps,
+# graceful shutdown). Those coexist fine with pure-Python processes, but a
+# segfault seen on CSF3 -- in JPype's own, definitely-legitimate handling
+# of `from java.io import File` (not some unrelated/misidentified
+# package -- see _harden_jpype_import_hook() below for that separate,
+# already-fixed issue) -- points at a second, independent problem: the JVM
+# sharing a process with CUDA (loaded via torch, confirmed present in the
+# crash dump's loaded-extension-modules list) is a known source of signal
+# handler conflicts, because CUDA's driver also install its own signal
+# handling for its own error reporting. "-Xrs" is the standard mitigation
+# for "embedding a JVM in a process that also does its own native signal
+# handling" -- it's used for exactly this kind of scenario. Unverified in
+# the environment that actually crashes (this sandbox has never
+# reproduced the segfault), but it targets a real, documented mechanism
+# distinct from (and in addition to) the import-hook hardening below.
+_JVM_EXTRA_ARGS = ("-Xrs",)
 
 # The complete set of Java top-level domains anything in genom_pipeline's
 # dependency chain actually imports via the `from <java_pkg> import ...`
@@ -152,11 +190,33 @@ def _init_jvm() -> None:
 
     Memory limit is controlled by the GENOM_JVM_MEMORY environment
     variable; defaults to "8g" to match DeepOnto's own default.
+
+    Starts the JVM with the extra "-Xrs" flag instead of calling
+    deeponto.init_jvm(memory) directly (which starts it without that
+    flag) -- see _JVM_EXTRA_ARGS below for why.
     """
     if jpype.isJVMStarted():
         return
     memory = os.environ.get("GENOM_JVM_MEMORY", _DEFAULT_JVM_MEMORY)
-    deeponto.init_jvm(memory)
+
+    jars_dir = os.path.join(os.path.dirname(os.path.realpath(deeponto.__file__)), "lib")
+    if not os.path.isdir(jars_dir):
+        # DeepOnto's packaged jars moved or aren't where expected -- fall
+        # back to letting DeepOnto start its own JVM rather than fail
+        # outright. This loses the -Xrs mitigation below, but only in a
+        # situation this module can't handle anyway.
+        deeponto.init_jvm(memory)
+        return
+
+    jars = os.pathsep.join(os.path.join(jars_dir, name) for name in os.listdir(jars_dir))
+    jpype.startJVM(
+        jpype.getDefaultJVMPath(),
+        "-ea",
+        *_JVM_EXTRA_ARGS,
+        f"-Xmx{memory}",
+        "-Djava.class.path=" + jars,
+        convertStrings=False,
+    )
 
 
 _init_jvm()

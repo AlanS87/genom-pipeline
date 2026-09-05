@@ -96,10 +96,11 @@ def test_init_jvm_skips_when_already_started(monkeypatch):
     # Regression case for the CI break: deeponto.onto's module-level code
     # calls click.prompt(...) for JVM memory unless jpype.isJVMStarted() is
     # already True. If the JVM is (or claims to be) started, we must not
-    # call deeponto.init_jvm() again -- jpype only allows starting it once
-    # per process.
+    # try to start it again -- jpype only allows starting it once per
+    # process.
     monkeypatch.setattr(_deeponto_compat.jpype, "isJVMStarted", lambda: True)
     calls = []
+    monkeypatch.setattr(_deeponto_compat.jpype, "startJVM", lambda *a, **k: calls.append((a, k)))
     monkeypatch.setattr(_deeponto_compat.deeponto, "init_jvm", lambda memory: calls.append(memory))
 
     _deeponto_compat._init_jvm()
@@ -108,22 +109,50 @@ def test_init_jvm_skips_when_already_started(monkeypatch):
 
 
 def test_init_jvm_starts_with_default_memory(monkeypatch):
+    # _init_jvm() now calls jpype.startJVM() directly (with the extra
+    # -Xrs flag, see _JVM_EXTRA_ARGS) instead of deeponto.init_jvm(), so
+    # that this codepath is not silently skipped, only mock startJVM at
+    # the jpype level and check the memory flag it was actually given.
     monkeypatch.setattr(_deeponto_compat.jpype, "isJVMStarted", lambda: False)
     monkeypatch.delenv("GENOM_JVM_MEMORY", raising=False)
     calls = []
-    monkeypatch.setattr(_deeponto_compat.deeponto, "init_jvm", lambda memory: calls.append(memory))
+    monkeypatch.setattr(_deeponto_compat.jpype, "startJVM", lambda *a, **k: calls.append(a))
 
     _deeponto_compat._init_jvm()
 
-    assert calls == [_deeponto_compat._DEFAULT_JVM_MEMORY]
+    assert len(calls) == 1
+    args = calls[0]
+    assert f"-Xmx{_deeponto_compat._DEFAULT_JVM_MEMORY}" in args
+    for flag in _deeponto_compat._JVM_EXTRA_ARGS:
+        assert flag in args
 
 
 def test_init_jvm_respects_env_override(monkeypatch):
     monkeypatch.setattr(_deeponto_compat.jpype, "isJVMStarted", lambda: False)
     monkeypatch.setenv("GENOM_JVM_MEMORY", "2g")
     calls = []
-    monkeypatch.setattr(_deeponto_compat.deeponto, "init_jvm", lambda memory: calls.append(memory))
+    monkeypatch.setattr(_deeponto_compat.jpype, "startJVM", lambda *a, **k: calls.append(a))
 
     _deeponto_compat._init_jvm()
 
-    assert calls == ["2g"]
+    assert len(calls) == 1
+    assert "-Xmx2g" in calls[0]
+
+
+def test_init_jvm_falls_back_to_deeponto_if_jars_dir_missing(monkeypatch, tmp_path):
+    # If DeepOnto's packaged jars ever move, _init_jvm() falls back to
+    # deeponto.init_jvm() (losing the -Xrs mitigation) rather than
+    # crashing outright.
+    monkeypatch.setattr(_deeponto_compat.jpype, "isJVMStarted", lambda: False)
+    monkeypatch.setattr(
+        _deeponto_compat.deeponto, "__file__", str(tmp_path / "nonexistent_pkg" / "__init__.py")
+    )
+    startjvm_calls = []
+    monkeypatch.setattr(_deeponto_compat.jpype, "startJVM", lambda *a, **k: startjvm_calls.append(a))
+    init_jvm_calls = []
+    monkeypatch.setattr(_deeponto_compat.deeponto, "init_jvm", lambda memory: init_jvm_calls.append(memory))
+
+    _deeponto_compat._init_jvm()
+
+    assert startjvm_calls == []
+    assert init_jvm_calls == [_deeponto_compat._DEFAULT_JVM_MEMORY]
