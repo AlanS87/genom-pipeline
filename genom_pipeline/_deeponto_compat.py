@@ -31,17 +31,92 @@ happens.
 
 This module also starts DeepOnto's JVM as a side effect of being imported,
 before it does anything else -- see _init_jvm() below for why that has to
-happen here specifically.
+happen here specifically. It also hardens JPype's global import hook
+against a real segfault seen on CSF3 -- see _harden_jpype_import_hook()
+below for why that's needed and why "start the JVM before importing your
+own heavy dependencies" (an earlier, incomplete fix) doesn't actually solve
+this.
 """
 
 import os
 import warnings
 
 import jpype
+import jpype.imports  # registers jpype's global import hook as a side effect
 
 import deeponto
 
 _DEFAULT_JVM_MEMORY = "8g"
+
+# The complete set of Java top-level domains anything in genom_pipeline's
+# dependency chain actually imports via the `from <java_pkg> import ...`
+# syntax -- verified by grepping every .py file in the installed deeponto
+# package (not just the ones genom_pipeline currently reaches) for
+# `from {java,javax,org,com,de,net,edu,gov,mil,uk}.* import`: only
+# `org.*` (OWL API, ELK, HermiT, org.mowl), `java.*` (java.io/java.lang/
+# java.util) and `de.tudresden.*` (the jcel reasoner OntologyNormaliser
+# uses) are ever used. `javax` is included defensively -- it's one of
+# JPype's own standard recognised domains and costs nothing to allow.
+_JAVA_TLDS = frozenset({"java", "javax", "org", "de"})
+
+
+def _harden_jpype_import_hook() -> None:
+    """
+    Work around a real segfault seen on CSF3 in JPype's global import hook.
+
+    Once the JVM is started, JPype's _JImportLoader.find_spec (registered
+    on sys.meta_path by `import jpype.imports` above) is consulted for
+    *every* import anywhere in the process, not just Java ones -- and for
+    any single-segment module name, its real implementation (see JPype's
+    own imports.py) calls into the JVM via `_jpype.isPackage(name)` to ask
+    "is this a Java package?", *regardless of whether the name looks like
+    one*. On CSF3, asking that question about an ordinary Python package
+    name can segfault outright instead of returning False -- three
+    different, unrelated packages (torch, transformers's httpx dependency
+    pulling in the stdlib mimetypes module, and transformers.trainer_utils
+    checking for the optional 'peft' package) were each observed crashing
+    this way, at various different points during collection.
+
+    Pre-importing specific heavy packages before the JVM starts (an
+    earlier, incomplete version of this fix) only protects against
+    whichever package happens to be *first* -- and DeepOnto's own
+    deeponto.onto subpackage imports a long, version-dependent tail of
+    third-party libraries (click, yacs, rdflib, networkx, nltk, spacy,
+    anytree, IPython, dill, PyYAML, plus transformers/torch again) spread
+    across its six onto submodules, interleaved with the real Java imports
+    those same files need. There's no import order that avoids all of it
+    short of enumerating and pre-importing DeepOnto's entire, and possibly
+    changing, dependency closure.
+
+    The actual fix is narrower and more robust: wrap find_spec so it only
+    ever forwards to JPype's real (crash-prone-for-non-Java-names)
+    implementation for names under _JAVA_TLDS above, and returns None
+    (meaning "not a Java import, let Python's normal import machinery
+    handle it") for everything else -- without ever calling
+    `_jpype.isPackage()` on them. This is safe regardless of what
+    DeepOnto (or anything else) imports, in what order, or whether the JVM
+    has started yet, because nothing in this codebase's dependency chain
+    does Java-style imports (`from <pkg> import ...` resolved via this
+    hook, as opposed to a normal pip-installed package) outside of
+    _JAVA_TLDS -- verified by grepping every .py file in the installed
+    deeponto package for such imports.
+    """
+    loader_cls = jpype.imports._JImportLoader
+    if getattr(loader_cls.find_spec, "_genom_hardened", False):
+        return
+
+    _original_find_spec = loader_cls.find_spec
+
+    def _hardened_find_spec(self, name, path, target=None):
+        if name.partition(".")[0] not in _JAVA_TLDS:
+            return None
+        return _original_find_spec(self, name, path, target)
+
+    _hardened_find_spec._genom_hardened = True
+    loader_cls.find_spec = _hardened_find_spec
+
+
+_harden_jpype_import_hook()
 
 
 def _init_jvm() -> None:
