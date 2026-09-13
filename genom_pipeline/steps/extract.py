@@ -136,9 +136,26 @@ def run(
     src_onto_path: str,
     tgt_onto_path: str,
     output_pt_path: str,
+    reasoner_type: str = "hermit",
 ) -> str:
     """
     Step 1: ontology -> concept store (.pt)
+
+    Parameters
+    reasoner_type: passed straight through to deeponto.onto.Ontology(...,
+        reasoner_type=...). One of "hermit" (default, full OWL DL tableau
+        reasoner -- correct for any ontology but can be extremely memory-
+        hungry/slow on large ones), "elk" (polynomial-time EL++ reasoner --
+        far cheaper on memory/time, correct as long as the ontology's
+        subsumption-relevant axioms fall in the EL profile, which large
+        biomedical ontologies like FMA/SNOMED-CT/NCIT normally do -- this is
+        why OAEI Bio-ML tooling such as BERTMap/LogMap default to elk for
+        these), or "struct" (deeponto's structural/non-logical reasoner).
+        Kept as "hermit" by default so existing callers/results (e.g. the
+        smaller OMIM-ORDO pair) are unaffected; pass "elk" explicitly for
+        ontologies too large for HermiT to classify within available JVM
+        heap (see genom_stage_runner.py's --reasoner_type / a YAML task
+        file's extract.reasoner_type for how this test driver exposes it).
 
     Output format:
       {
@@ -149,8 +166,8 @@ def run(
     """
     cf = BERTMapPipeline.load_bertmap_config()
 
-    src_onto = Ontology(src_onto_path)
-    tgt_onto = Ontology(tgt_onto_path)
+    src_onto = Ontology(src_onto_path, reasoner_type=reasoner_type)
+    tgt_onto = Ontology(tgt_onto_path, reasoner_type=reasoner_type)
 
     src_dict = extract_ontology_dict(src_onto, cf)
     tgt_dict = extract_ontology_dict(tgt_onto, cf)
