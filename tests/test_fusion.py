@@ -112,3 +112,22 @@ def test_dedup_one_to_one_priority_order_wins():
     ]
     out = fusion.dedup_one_to_one(rows, enforce_target_uniqueness=True)
     assert out == [("A", "X", 0.9, "exact")]
+
+
+def test_dedup_one_to_one_always_collapses_exact_duplicate_pairs():
+    # Even with both uniqueness flags off (pure threshold filtering, no
+    # 1-to-1/1-to-many restriction at all), the same (src, tgt) pair proposed
+    # twice -- e.g. once by an exact matcher, once by the LLM -- must not
+    # appear as two separate output rows. Row order decides which one wins;
+    # here the exact-matcher row comes first (as "exact_priority" strategy
+    # arranges it) so it wins over the later LLM row for the identical pair.
+    rows = [
+        ("A", "X", 0.9, "exact"),
+        ("A", "X", 0.6, "llm"),  # exact duplicate of the row above -> dropped
+        ("A", "Y", 0.99, "llm"),  # different pair, both flags off -> kept
+        ("B", "X", 0.5, "llm"),  # different pair, both flags off -> kept
+    ]
+    out = fusion.dedup_one_to_one(
+        rows, enforce_target_uniqueness=False, enforce_source_uniqueness=False
+    )
+    assert out == [("A", "X", 0.9, "exact"), ("A", "Y", 0.99, "llm"), ("B", "X", 0.5, "llm")]
