@@ -30,12 +30,31 @@ def run_pipeline(
     overwrite: bool = False,
     llm_model: Optional[str] = None,
     embedding_model: Optional[str] = None,
+    reasoner_type: str = "hermit",
     llm_config: Optional[Dict[str, Any]] = None,
     embed_config: Optional[Dict[str, Any]] = None,
     retrieve_config: Optional[Dict[str, Any]] = None,
     fuse_config: Optional[Dict[str, Any]] = None,
     run_definition: bool = True,
 ) -> PipelineResult:
+    """
+    ...
+
+    reasoner_type: forwarded to steps.extract.run(reasoner_type=...), in turn
+        forwarded to deeponto.onto.Ontology(reasoner_type=...). "hermit"
+        (default) is a full OWL DL reasoner -- correct for any ontology but
+        can be extremely slow/memory-hungry on very large ones (tens of
+        thousands of classes). "elk" is a much cheaper polynomial-time EL++
+        reasoner, correct as long as the ontology's subsumption-relevant
+        axioms fall in the EL profile, which large biomedical ontologies
+        (FMA, SNOMED-CT, NCIT, ...) normally do -- the same reason OAEI
+        Bio-ML tooling such as BERTMap/LogMap defaults to elk for these. Kept
+        as "hermit" here so existing callers are unaffected by default; pass
+        "elk" explicitly for ontologies too large for HermiT to classify
+        within available JVM heap (see the `GENOM_JVM_MEMORY` environment
+        variable, documented in `genom_pipeline/_deeponto_compat.py`, to
+        raise the JVM heap size itself).
+    """
     wd = Path(workdir)
     _ensure_dir(wd)
 
@@ -52,7 +71,7 @@ def run_pipeline(
     # Step 1
     if _should_run(concept_store_pt, overwrite):
         from genom_pipeline.steps.extract import run as step1_extract
-        step1_extract(src_onto_path, tgt_onto_path, str(concept_store_pt))
+        step1_extract(src_onto_path, tgt_onto_path, str(concept_store_pt), reasoner_type=reasoner_type)
 
     # Step 2
     if run_definition:
