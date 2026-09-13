@@ -37,28 +37,53 @@ def select_rank1_candidates(df: pd.DataFrame) -> pd.DataFrame:
 def dedup_one_to_one(
     rows: List[MappingRow],
     enforce_target_uniqueness: bool = True,
+    enforce_source_uniqueness: bool = True,
 ) -> List[MappingRow]:
     """
-    Greedily keep rows in the order given, allowing each src_iri to be used
-    at most once. When enforce_target_uniqueness is True (default), each
-    tgt_iri is also allowed at most once, so the result is a valid 1-to-1
-    equivalence alignment (matches the OAEI Bio-ML evaluation assumption).
+    Greedily keep rows in the order given. When enforce_source_uniqueness is
+    True (default, matches this function's original/historical behaviour),
+    each src_iri is allowed at most once. When enforce_target_uniqueness is
+    also True (default), each tgt_iri is also allowed at most once, so the
+    result is a valid 1-to-1 equivalence alignment (matches the OAEI Bio-ML
+    evaluation assumption used to pick these defaults).
+
+    Some domains genuinely have one-to-many / many-to-one correspondences
+    instead (e.g. OMIM<->ORDO: one rare-disease OMIM entry can legitimately
+    correspond to several ORDO subtypes, and vice versa) -- set either flag
+    to False to stop collapsing those down to a single row per src/tgt.
+    Setting both to False keeps every row that passes the upstream
+    threshold/rank filtering, i.e. no dedup at all.
 
     Caller controls priority by row order: put the rows that should win a
     conflict first (e.g. exact-matcher rows before LLM rows for an
     "exact first" strategy).
+
+    Regardless of either flag, an exact duplicate (src_iri, tgt_iri) pair is
+    always collapsed to its first occurrence -- e.g. when both an exact
+    matcher and the LLM independently propose the same pair, "exact_priority"
+    strategy puts the exact-matcher row first, so that row wins and the LLM's
+    row for the same pair is dropped rather than appearing as a second,
+    redundant line in the output. This is unconditional (not controlled by
+    enforce_source_uniqueness/enforce_target_uniqueness) because it isn't a
+    1-to-1 policy choice -- it's just not duplicating the same literal pair.
     """
     src_seen: set = set()
     tgt_seen: set = set()
+    pair_seen: set = set()
     out: List[MappingRow] = []
 
     for src, tgt, score, prov in rows:
-        if src in src_seen:
+        pair = (src, tgt)
+        if pair in pair_seen:
+            continue
+        if enforce_source_uniqueness and src in src_seen:
             continue
         if enforce_target_uniqueness and tgt in tgt_seen:
             continue
         out.append((src, tgt, score, prov))
-        src_seen.add(src)
+        pair_seen.add(pair)
+        if enforce_source_uniqueness:
+            src_seen.add(src)
         if enforce_target_uniqueness:
             tgt_seen.add(tgt)
 
@@ -94,6 +119,11 @@ def run(
         0.9. Set to None to disable this filter.
       enforce_target_uniqueness: bool, also enforce that each tgt_iri is used
         at most once (a true 1-to-1 alignment). Default True.
+      enforce_source_uniqueness: bool, enforce that each src_iri is used at
+        most once. Default True (this was previously unconditional/always
+        on -- see dedup_one_to_one()). Set to False, together with
+        use_llm_rank1_only=False, to allow one-to-many / many-to-one
+        alignments for domains where that's expected (e.g. OMIM<->ORDO).
       use_llm_rank1_only: bool default True. When True, only the single
         best-ranked LLM candidate per src_iri (among those passing both
         thresholds) is considered.
@@ -111,6 +141,7 @@ def run(
     llm_threshold = float(fuse_config.get("llm_threshold", 0.9))
     cs_threshold = fuse_config.get("cs_threshold", 0.9)
     enforce_target_uniqueness = bool(fuse_config.get("enforce_target_uniqueness", True))
+    enforce_source_uniqueness = bool(fuse_config.get("enforce_source_uniqueness", True))
     use_llm_rank1_only = bool(fuse_config.get("use_llm_rank1_only", True))
 
     store = torch.load(store_pt_path)
@@ -160,7 +191,11 @@ def run(
     else:
         raise ValueError(f"Unknown fuse strategy: {strategy!r}")
 
-    final_rows = dedup_one_to_one(candidate_rows, enforce_target_uniqueness=enforce_target_uniqueness)
+    final_rows = dedup_one_to_one(
+        candidate_rows,
+        enforce_target_uniqueness=enforce_target_uniqueness,
+        enforce_source_uniqueness=enforce_source_uniqueness,
+    )
 
     df_out = pd.DataFrame(final_rows, columns=["src_iri", "tgt_iri", "score", "provenance"])
     df_out.to_csv(out_path, index=False)
@@ -169,6 +204,7 @@ def run(
     meta["fuse_llm_threshold"] = llm_threshold
     meta["fuse_cs_threshold"] = cs_threshold
     meta["fuse_enforce_target_uniqueness"] = enforce_target_uniqueness
+    meta["fuse_enforce_source_uniqueness"] = enforce_source_uniqueness
     meta["fuse_use_llm_rank1_only"] = use_llm_rank1_only
     meta["fuse_exact_matcher"] = exact_name or None
     meta["fuse_exact_config"] = exact_spec.get("config", {}) if exact_name else {}
