@@ -63,7 +63,12 @@ A seventh, optional stage lives outside `run_pipeline()`: `genom_pipeline/evalua
         └── metrics.py            # precision/recall/F1 + threshold grid search (not part of run_pipeline)
 
     scripts/
-    └── download_logmap.sh        # fetches the LogMap standalone jar at setup time (not vendored in git)
+    ├── download_logmap.sh        # fetches the LogMap standalone jar at setup time (not vendored in git)
+    ├── genom_stage_runner.py     # run ONE stage per OS process (CLI flags or --config a YAML task file) -- see below
+    └── example_slurm_job.sbatch  # worked example: submitting a full task on an HPC/SLURM cluster
+
+    tasks/
+    └── example_task.yaml         # worked example YAML task file for scripts/genom_stage_runner.py
 
     tests/                        # pytest suite, run in CI (see .github/workflows/ci.yml)
     docs/
@@ -137,6 +142,12 @@ So the smallest realistic first call is exactly the Quick Start example above, m
 
 Every stage takes a plain `dict` of options rather than a config file. All keys below are optional unless noted; defaults are what the code uses when a key is omitted.
 
+### `reasoner_type` (stage 1 `extract`, a direct `run_pipeline()` argument -- not nested in a dict)
+
+| Default | Meaning |
+|---|---|
+| `"hermit"` | OWL reasoner used to compute each concept's inferred (not just asserted) superclasses. `"hermit"` is a full OWL DL reasoner: correct for any ontology, but can be extremely slow, or run out of JVM heap, on very large ones (tens of thousands of classes). `"elk"` is a much cheaper polynomial-time EL++ reasoner -- correct as long as the ontology's subsumption-relevant axioms fall in the EL profile, which large biomedical ontologies (FMA, SNOMED-CT, NCIT, ...) normally do, which is also why OAEI Bio-ML tooling such as BERTMap/LogMap defaults to `elk` for these. `"struct"` (DeepOnto's structural/non-logical reasoner) is also accepted. If `extract` fails with a Java heap `OutOfMemoryError`, try `"elk"` here and/or raise the `GENOM_JVM_MEMORY` environment variable (see [Notes](#notes)). |
+
 ### `llm_config` (shared by stage 2 `define` and stage 5 `judge`)
 
 | Key | Default | Meaning |
@@ -177,7 +188,8 @@ Every stage takes a plain `dict` of options rather than a config file. All keys 
 | `strategy` | `"exact_priority"` | `"exact_priority"` / `"union"` (currently identical -- both put exact-matcher rows first) or `"llm_then_exact_fill"` (LLM rows win conflicts, exact matcher only fills srcs the LLM didn't cover). |
 | `llm_threshold` | `0.9` | Minimum `confidence` (LLM YES-probability) to keep a candidate. |
 | `cs_threshold` | `0.9` | Minimum `score` (cosine similarity, from stage 4) to keep a candidate. Set to `None` to disable. |
-| `enforce_target_uniqueness` | `True` | Also enforce that each target concept is used at most once (a true 1-to-1 alignment), not just each source concept. |
+| `enforce_target_uniqueness` | `True` | Also enforce that each target concept is used at most once (a true 1-to-1 alignment). |
+| `enforce_source_uniqueness` | `True` | Enforce that each source concept is used at most once. Set both this and `enforce_target_uniqueness` to `False` (together with `use_llm_rank1_only=False`) for domains with genuine one-to-many/many-to-one correspondences (e.g. OMIM&harr;ORDO). Regardless of either flag, the exact same `(src_iri, tgt_iri)` pair proposed twice (e.g. by both an exact matcher and the LLM) is always collapsed to one row. |
 | `use_llm_rank1_only` | `True` | Only the best-ranked surviving candidate per source concept is kept. |
 | `exact` | `None` | `{"name": "bertmaplt_string" \| "logmaplt_file" \| "logmaplt_subprocess", "config": {...}}`. Omit entirely to skip exact matching -- see [Exact Matching](#exact-matching) for each matcher's own config keys. |
 
@@ -233,6 +245,77 @@ print(metrics.best_thresholds(grid))
 
 ---
 
+## Running Stage-by-Stage on an HPC/SLURM Cluster
+
+`run_pipeline()` (above) runs all six stages in one Python process -- the simplest way to call genom_pipeline, and a fine default. `scripts/genom_stage_runner.py` is an alternative driver that runs **one stage per OS process**, which matters on a shared HPC cluster for two reasons:
+
+- Stages 2 (`define`) and 5 (`judge`) each load a full local causal LM (e.g. a 32B-parameter model) via `device_map="auto"`. Running them as separate processes means the OS/CUDA driver fully reclaims GPU memory when one process exits, before the next stage's process starts -- a stronger guarantee than the in-process `del`/`gc.collect()`/`empty_cache()` cleanup `run_pipeline()` relies on (see [Notes](#notes)).
+- A crash or SLURM walltime timeout in a later, cheap stage (e.g. `embed`'s OpenAI calls) does not require re-running the expensive GPU stages that already finished and checkpointed to disk.
+
+### Two ways to invoke it
+
+```bash
+# 1) Flags on the command line
+python3 scripts/genom_stage_runner.py extract --workdir runs/example --src src.owl --tgt tgt.owl
+
+# 2) A YAML task file (recommended -- see tasks/example_task.yaml)
+python3 scripts/genom_stage_runner.py extract --config tasks/my_task.yaml
+```
+
+Both call the exact same underlying dispatch logic, so the two entry points can never silently diverge in behaviour. When `--config` is given, every other flag is ignored -- the YAML alone determines that run.
+
+### YAML task file shape
+
+Copy `tasks/example_task.yaml` and fill in the placeholders. One file describes one whole ontology-matching task; top-level keys are shared across every stage, and a top-level key matching a stage name (`extract`/`define`/`embed`/`retrieve`/`judge`/`fusion`) holds overrides used only when running that stage:
+
+```yaml
+task_name: my_task          # workdir becomes "<output_root>/<task_name>" automatically
+output_root: ./genom_runs
+source_ontology_name: SourceOntologyName
+target_ontology_name: TargetOntologyName
+llm_model: Qwen/Qwen2.5-32B-Instruct
+embedding_model: text-embedding-3-small
+topk: 20
+domain: general
+overwrite: false            # keep false across the whole task -- see "Resuming a run" below
+
+extract:
+  src: /path/to/source_ontology.owl
+  tgt: /path/to/target_ontology.owl
+  reasoner_type: hermit      # or "elk" for very large ontologies -- see Configuration Reference
+
+retrieve:
+  index_type: flatip
+
+fusion:
+  fuse_strategy: exact_priority
+  fuse_llm_threshold: 0.9
+  fuse_cs_threshold: 0.9
+  # exact_matcher: bertmaplt_string   # optional, see Exact Matching
+  # exact_config: {...}
+```
+
+Run each stage in order (`extract`, `define`, `embed`, `retrieve`, `judge`, `fusion`), each as its own `python3 scripts/genom_stage_runner.py <stage> --config ...` invocation -- see `scripts/example_slurm_job.sbatch` for a complete SLURM job doing exactly this.
+
+Unrecognised top-level keys (e.g. a typo like `fuse_strategie`) raise an error immediately rather than silently being ignored.
+
+### Resuming a run
+
+Keep `overwrite: false` for the whole task, including any resubmitted/chained job:
+
+- `extract`, `retrieve`, `judge`, and `fusion` each skip re-doing their work if their output file already exists.
+- `define` and `judge` additionally checkpoint incrementally (every `checkpoint_every_n_batches` batches) so a job killed mid-stage (e.g. a SLURM walltime limit) resumes from its last checkpoint instead of restarting that stage from scratch.
+
+So if a job runs out of wallclock partway through, simply resubmitting the exact same script picks up where it stopped.
+
+### Every invocation records what it ran with
+
+Each stage run appends the exact config it used to `<workdir>/run_config.json` (keyed by stage), including `_config_source` (`"cli"` or the YAML file's absolute path) -- so "what parameters did stage X actually run with" is always answerable by reading that file.
+
+`run_stage(config)` and `run_from_yaml(config_path, stage)` are also plain importable Python functions, for driving a stage programmatically (e.g. looping over several YAML task files) without going through the command line at all.
+
+---
+
 ## Input
 
 - Source ontology (`.owl`)
@@ -281,6 +364,8 @@ A single task is used for threshold selection, and the same thresholds are appli
 - LLM outputs are used as semantic signals
 - **DeepOnto compatibility patch**: DeepOnto's verbaliser (used by stage 1 to turn complex class expressions into natural language) does not support the OWL `DataHasValue` data property restriction, and crashes on any ontology that uses it -- SNOMED-CT being a real-world example. `genom_pipeline/_deeponto_compat.py` monkey-patches this at import time (applied automatically by `steps/extract.py`) to drop the unsupported sub-expression instead of crashing, emitting a `genom_pipeline._deeponto_compat.DataHasValueOmittedWarning` each time it happens so the information loss is visible rather than silent. This is a workaround for an upstream DeepOnto limitation, not a genom_pipeline design choice -- remove it once DeepOnto supports `DataHasValue` natively.
 - **Non-interactive JVM startup**: DeepOnto starts a JVM (via `jpype`) the first time anything imports `deeponto.onto`, and will interactively prompt on stdin for how much memory to give it (`Please enter the maximum memory located to JVM`) unless the JVM is already running -- this blocks forever, and errors outright under pytest (`OSError: reading from stdin while output is captured!`), in any non-interactive context such as CI. `genom_pipeline/_deeponto_compat.py` starts the JVM itself, non-interactively, as soon as it's imported (before any `deeponto.onto` import anywhere in genom_pipeline), so the prompt never fires. The memory limit defaults to `8g` (DeepOnto's own default) and can be overridden with the `GENOM_JVM_MEMORY` environment variable, e.g. `GENOM_JVM_MEMORY=4g python your_script.py`.
+- **`retrieve_config["index_type"]="hnsw"`'s `score` column is cosine similarity**, same as `"flatip"`/`"ivf"` -- `_build_faiss_index()` passes `faiss.METRIC_INNER_PRODUCT` explicitly for all three index types (higher `score` = more similar everywhere, which `fuse_config["cs_threshold"]` assumes). If you have `final_alignment.csv`/`candidates_top{k}.csv` output generated with `index_type="hnsw"` from before this fix, its `score` column was actually an L2 distance (lower = more similar, the opposite convention) -- re-run stage 4 (`retrieve`) to regenerate it before trusting `score`/`cs_threshold` values from that output.
+- **GPU memory between `define` and `judge`**: both load a full local causal LM (`llm_model`) via `device_map="auto"`; `run_pipeline()` calls them sequentially in one process, and each explicitly `del`s its model, `gc.collect()`s, and `torch.cuda.empty_cache()`s before returning, so the second model load doesn't have to compete with GPU memory the first model is done using. If you need a stronger guarantee (a full OS-level reclaim between every stage), run stage-by-stage with `scripts/genom_stage_runner.py` instead -- see below.
 
 ---
 
@@ -318,6 +403,19 @@ If you use this repository, please cite the published version:
 
 A preprint version is also available on arXiv (arXiv:2508.10703); the published
 version above is the canonical, peer-reviewed reference.
+
+---
+
+## Changelog
+
+**Unreleased / next release** -- fixes found while reproducing the paper's results end-to-end on a second, larger OAEI Bio-ML task pair:
+
+- Fixed `retrieve.py`'s `"hnsw"` index defaulting to L2 distance instead of cosine similarity (see [Notes](#notes)).
+- Added `reasoner_type` (`extract`/`run_pipeline()`), so large ontologies (tens of thousands of classes) can use the much cheaper `"elk"` reasoner instead of the default `"hermit"`, which can run out of JVM heap on them.
+- `fusion.py`: added `enforce_source_uniqueness`, and the exact same `(src_iri, tgt_iri)` pair is now always collapsed to one row regardless of the uniqueness flags.
+- `define.py`: batched definition generation (was one concept at a time); `define.py`/`judge.py`: incremental checkpointing so an interrupted run resumes instead of restarting; both now explicitly free GPU memory (`del` + `gc.collect()` + `torch.cuda.empty_cache()`) before returning.
+- Fixed a JPype/JVM native-signal-handling segfault that could occur when a JVM (started for DeepOnto) shares a process with CUDA (via `torch`).
+- Added `scripts/genom_stage_runner.py`, a per-stage/HPC-SLURM driver with an equivalent CLI-flags or `--config a_task.yaml` interface -- see [Running Stage-by-Stage on an HPC/SLURM Cluster](#running-stage-by-stage-on-an-hpcslurm-cluster).
 
 ---
 
