@@ -1,0 +1,73 @@
+# Example task file for scripts/genom_stage_runner.py.
+#
+# Copy this file (e.g. `cp tasks/example_task.yaml tasks/my_task.yaml`), fill
+# in the placeholders below, and run each stage with:
+#   python3 scripts/genom_stage_runner.py <stage> --config tasks/my_task.yaml
+# where <stage> is one of: extract, define, embed, retrieve, judge, fusion
+# (run them in that order -- see the README's "Running Stage-by-Stage on an
+# HPC/SLURM Cluster" section for the full explanation and a worked example).
+#
+# Shape: top-level keys are shared across every stage; a top-level key that
+# matches a stage name (extract/define/embed/retrieve/judge/fusion) holds
+# overrides used only when running that stage. One file describes one whole
+# ontology-matching task/dataset; you run it stage-by-stage, and different
+# tasks should use different `task_name`s so their outputs never collide.
+
+# task_name + output_root -> workdir is automatically "<output_root>/<task_name>"
+# (set an explicit `workdir:` instead if you want a specific path).
+task_name: my_task
+output_root: ./genom_runs
+
+source_ontology_name: SourceOntologyName
+target_ontology_name: TargetOntologyName
+llm_model: Qwen/Qwen2.5-32B-Instruct
+embedding_model: text-embedding-3-small
+topk: 20
+# "general" (default) uses a generic "ontology and knowledge representation
+# expert" system prompt for define/judge; set a domain (e.g. "biomedical")
+# to instead use "an ontology expert specialising in the {domain} domain".
+domain: general
+# Keep this false across the whole task, including any resubmitted/chained
+# job -- it's what lets extract/define/embed/judge each skip work they've
+# already finished instead of redoing (or destroying) it. Only set true if
+# you deliberately want to force a full from-scratch redo of a stage.
+overwrite: false
+
+extract:
+  src: /path/to/source_ontology.owl
+  tgt: /path/to/target_ontology.owl
+  # "hermit" (default, can be omitted) is a full OWL DL reasoner: correct
+  # for any ontology but can run out of memory / be extremely slow on very
+  # large ones (tens of thousands of classes). "elk" is a much cheaper
+  # polynomial-time EL++ reasoner -- appropriate for large biomedical
+  # ontologies (FMA, SNOMED-CT, NCIT, ...) whose subsumption-relevant axioms
+  # fall in the EL profile, which is also why OAEI Bio-ML tooling such as
+  # BERTMap/LogMap defaults to elk for these. If extract fails with a Java
+  # heap OutOfMemoryError, try "elk" here, and/or raise GENOM_JVM_MEMORY
+  # (an environment variable, default "8g", read by
+  # genom_pipeline/_deeponto_compat.py) before running this stage.
+  reasoner_type: hermit
+
+retrieve:
+  # "hnsw" (default) is an approximate nearest-neighbour index -- fast, but
+  # can give a small amount of run-to-run non-determinism in which
+  # candidates are retrieved. "flatip" is exact brute-force search: fully
+  # deterministic, and still fast unless both ontologies are very large
+  # (cost scales with len(src) * len(tgt) * embedding_dim).
+  index_type: flatip
+
+fusion:
+  fuse_strategy: exact_priority
+  fuse_llm_threshold: 0.9
+  fuse_cs_threshold: 0.9
+  # Optional: fuse in an exact matcher's mappings alongside the LLM
+  # judgments. Omit exact_matcher entirely (as below) to skip this. See
+  # genom_pipeline/exact_matcher/__init__.py for every registered matcher
+  # name and genom_pipeline/exact_matcher/bertmaplt_string.py for this one's
+  # config keys.
+  # exact_matcher: bertmaplt_string
+  # exact_config:
+  #   src_owl: /path/to/source_ontology.owl
+  #   tgt_owl: /path/to/target_ontology.owl
+  #   reasoner: elk
+  #   pool_size: 200
