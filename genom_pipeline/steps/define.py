@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -270,4 +271,26 @@ def run(
     store["meta"]["definition_batch_size"] = batch_size
 
     _atomic_torch_save(store, store_pt_path)
+
+    # Explicitly drop the model before returning instead of relying on the
+    # local `llm` simply going out of scope. `_load_hf_chat_model` uses
+    # device_map="auto", which routes the model through accelerate's
+    # big-model-inference hooks (AlignDevicesHook et al.) -- those hooks are
+    # attached as extra module attributes and commonly hold back-references
+    # to the module they're attached to, forming reference cycles that plain
+    # CPython refcounting cannot free immediately. Left alone, the ~60GB+
+    # (bf16, 32B-class model) of GPU memory would only be reclaimed whenever
+    # Python's cyclic GC next happens to run -- which is unpredictable timing
+    # to be relying on right before judge.py loads a second full model into
+    # the same process (see pipeline.py's run_pipeline(), which calls
+    # step2_define then step5_judge sequentially in one process). del + a
+    # forced gc.collect() breaks those cycles deterministically, and
+    # empty_cache() then returns the now-free blocks from PyTorch's caching
+    # allocator so the next model load can actually use that memory instead
+    # of appearing to need fresh GPU memory on top of it.
+    del llm
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return store_pt_path

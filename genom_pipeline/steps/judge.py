@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -296,6 +297,20 @@ def run(
 
     if prompts:
         _score_and_fill(row_ids, prompts)
+
+    # Same rationale as define.py's end-of-run() cleanup: _load_judge_model
+    # also uses device_map="auto" (accelerate hooks -> possible reference
+    # cycles), and this is the *second* of the two ~60GB+-class model loads
+    # that can happen in one process when run_pipeline() calls step2_define
+    # then step5_judge back to back. Freeing deterministically here matters
+    # most if judge.py is ever called again later in the same long-lived
+    # process (e.g. a driver script that loops over several ontology pairs),
+    # so the next judge/define load doesn't appear to need memory on top of
+    # a model that is actually done being used.
+    del judge
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     df["llm_model"] = llm_model
     df["input_fields"] = ",".join(input_fields)
