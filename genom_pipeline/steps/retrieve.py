@@ -79,7 +79,28 @@ def _build_faiss_index(
         m = int(index_params.get("m", 32))
         ef_construction = int(index_params.get("ef_construction", 200))
         ef_search = int(index_params.get("ef_search", 50))
-        h = faiss.IndexHNSWFlat(dim, m)
+        # BUG FIX: faiss.IndexHNSWFlat(d, M) defaults to METRIC_L2 (Euclidean
+        # distance) when no metric is given -- unlike IndexFlatIP/IndexIVFFlat
+        # above, which are explicitly inner-product. Since "hnsw" is this
+        # function's default index_type, every retrieve.py run that didn't
+        # explicitly pass index_type="flatip"/"ivf" was silently getting L2
+        # distances back from index.search() and storing them in the "score"
+        # column as if they were cosine similarities (src_mat/tgt_mat are
+        # L2-normalized, so this is a monotonic reparametrisation of cosine
+        # similarity: L2^2 = 2 - 2*cos_sim -- LOWER "score" actually means
+        # MORE similar under the old code, the opposite of what every
+        # downstream consumer assumes). This did not corrupt which top-k
+        # candidates were retrieved or their relative order (L2 distance and
+        # cosine similarity rank identically for normalized vectors), but it
+        # did corrupt the numeric score value -- and fusion.py's cs_threshold
+        # filter (meant to keep pairs with cosine similarity >= threshold)
+        # ends up doing the opposite: keeping weak matches with large L2
+        # "scores" and dropping genuinely well-matched pairs whose small L2
+        # distance reads as a low "score". Passing METRIC_INNER_PRODUCT here
+        # makes index.search() return true cosine similarity (since inputs
+        # are normalized) sorted best-first, matching flatip/ivf and every
+        # downstream threshold that assumes "higher score = more similar".
+        h = faiss.IndexHNSWFlat(dim, m, faiss.METRIC_INNER_PRODUCT)
         h.hnsw.efConstruction = ef_construction
         h.hnsw.efSearch = ef_search
         h.add(tgt_mat)
