@@ -180,6 +180,8 @@ Every stage takes a plain `dict` of options rather than a config file. All keys 
 | `normalize` | `True` | L2-normalize embeddings before indexing (so `score` is cosine similarity, not raw inner product). |
 | `index_type` | `"hnsw"` | `"flatip"` (exact), `"ivf"`, or `"hnsw"` (approximate). |
 | `index_params` | `{}` | Index-specific: `use_gpu`/`gpu_id`; IVF: `nlist`, `nprobe`; HNSW: `m`, `ef_construction`, `ef_search`. |
+| `query_side` | `"src"` | Which side's concepts drive the faiss nearest-neighbour search: `"src"` (default, original behaviour) builds the index over tgt embeddings and queries from src; `"tgt"` builds it over src embeddings and queries from tgt. The output CSV's `src_iri`/`tgt_iri`/`score`/`rank` columns keep the same meaning either way -- see [Making retrieve/judge scale with the smaller side](#making-retrievejudge-scale-with-the-smaller-side). Ignored if `query_side_auto` is `True`. |
+| `query_side_auto` | `False` | If `True`, ignore `query_side` and always query from whichever side has fewer concepts (tie keeps `"src"`), so the index is built over the larger side. |
 
 ### `fuse_config` (stage 6)
 
@@ -195,13 +197,26 @@ Every stage takes a plain `dict` of options rather than a config file. All keys 
 
 Reproducing the paper's reported setup: `llm_threshold=0.9`, `cs_threshold=0.9` (already the defaults), `llm_model="Qwen/Qwen2.5-32B-Instruct"`, Bio-ML (OAEI) datasets. A single task is used for threshold selection and the same thresholds are applied across all tasks.
 
+### Making retrieve/judge scale with the smaller side
+
+Stage 4 (`retrieve`) builds its faiss index over whichever side is NOT the query side, and queries once per concept on the query side -- so the number of candidate rows (and therefore the number of stage-5 `judge` LLM calls) scales with the size of the query side, not the matched side. For a very lopsided pair (e.g. one ontology with 10x as many concepts as the other), querying from the smaller side means a larger, more accurate index and far fewer, cheaper queries overall.
+
+Two ways to use this:
+
+- `retrieve_config={"query_side_auto": True}` (recommended) -- `retrieve.run()` measures `len(src concepts)` vs `len(tgt concepts)` itself and always queries from the smaller side (a tie keeps `"src"`). No need to know in advance which ontology in a given task pair is larger.
+- `retrieve_config={"query_side": "tgt"}` -- pin the query side explicitly instead of auto-detecting it.
+
+Either way this only changes retrieve's internal search direction and candidate generation -- the output CSV schema, and every later stage (`judge`/`fusion`/the exact matchers), are unaffected and still follow the input src/tgt convention as usual. The resolved side actually used is recorded in `store["meta"]["retrieve_query_side"]` (and whether auto was on, in `store["meta"]["retrieve_query_side_auto"]`).
+
+**Operational note**: `retrieve`'s output filename (`candidates_top{topk}.csv`) does not encode `query_side`/`query_side_auto`. With `overwrite: false` (the normal resume-friendly default), switching the query direction on a task that already has a `candidates_top{k}.csv` from a previous run will silently reuse the OLD file instead of regenerating it. Delete `candidates_top{k}.csv`, `llm_alignment.csv`, and judge's checkpoint file before re-running `retrieve` with a different `query_side`/`query_side_auto` on an existing `workdir`.
+
 ---
 
 ## Exact Matching
 
 Stage 6 can optionally fuse the LLM's predictions with an exact/lexical matcher via `fuse_config["exact"]`. Three matchers are registered:
 
-- **`bertmaplt_string`** -- runs BERTMap-Lt's string-matching module in-process via DeepOnto. `config`: `src_owl`, `tgt_owl` (required), `reasoner` (default `"elk"`), `pool_size` (default `200`), `apply_lowercasing` (default `True`).
+- **`bertmaplt_string`** -- runs BERTMap-Lt's string-matching module in-process via DeepOnto. `config`: `src_owl`, `tgt_owl` (required), `reasoner` (default `"elk"`), `pool_size` (default `200`), `apply_lowercasing` (default `True`). Works against a real, full production ontology (not just an OAEI-curated one) that has no `use_in_alignment` annotation at all -- see [Notes](#notes).
 - **`logmaplt_file`** -- loads a mapping TSV that some earlier, separate LogMap run already produced. `config`: `mapping_tsv` (required), `sep` (default `"\t"`), `has_header` (default `False`), `columns` (if `has_header`).
 - **`logmaplt_subprocess`** -- actually invokes the LogMap jar (`LITE` mode) and parses its output, instead of assuming a TSV already exists. `config`: `src_owl`, `tgt_owl` (required), `jar_path` (or set the `LOGMAP_JAR_PATH` env var), `output_dir`, `java_bin` (default `"java"`), `jvm_args`, `timeout` (default `1800`s), `mapping_filename` (only needed if LogMap's output file can't be auto-detected), `sep`, `has_header`, `overwrite`.
 
@@ -366,6 +381,8 @@ A single task is used for threshold selection, and the same thresholds are appli
 - **Non-interactive JVM startup**: DeepOnto starts a JVM (via `jpype`) the first time anything imports `deeponto.onto`, and will interactively prompt on stdin for how much memory to give it (`Please enter the maximum memory located to JVM`) unless the JVM is already running -- this blocks forever, and errors outright under pytest (`OSError: reading from stdin while output is captured!`), in any non-interactive context such as CI. `genom_pipeline/_deeponto_compat.py` starts the JVM itself, non-interactively, as soon as it's imported (before any `deeponto.onto` import anywhere in genom_pipeline), so the prompt never fires. The memory limit defaults to `8g` (DeepOnto's own default) and can be overridden with the `GENOM_JVM_MEMORY` environment variable, e.g. `GENOM_JVM_MEMORY=4g python your_script.py`.
 - **`retrieve_config["index_type"]="hnsw"`'s `score` column is cosine similarity**, same as `"flatip"`/`"ivf"` -- `_build_faiss_index()` passes `faiss.METRIC_INNER_PRODUCT` explicitly for all three index types (higher `score` = more similar everywhere, which `fuse_config["cs_threshold"]` assumes). If you have `final_alignment.csv`/`candidates_top{k}.csv` output generated with `index_type="hnsw"` from before this fix, its `score` column was actually an L2 distance (lower = more similar, the opposite convention) -- re-run stage 4 (`retrieve`) to regenerate it before trusting `score`/`cs_threshold` values from that output.
 - **GPU memory between `define` and `judge`**: both load a full local causal LM (`llm_model`) via `device_map="auto"`; `run_pipeline()` calls them sequentially in one process, and each explicitly `del`s its model, `gc.collect()`s, and `torch.cuda.empty_cache()`s before returning, so the second model load doesn't have to compete with GPU memory the first model is done using. If you need a stronger guarantee (a full OS-level reclaim between every stage), run stage-by-stage with `scripts/genom_stage_runner.py` instead -- see below.
+- **`bertmaplt_string` and a real, full production ontology's missing OAEI annotation**: `deeponto.align.oaei.get_ignored_class_index()` looks up the OAEI Bio-ML `use_in_alignment` annotation property on every class, and the installed deeponto version raises `KeyError: Cannot retrieve unknown IRI: ...` instead of returning nothing when that annotation property isn't declared in the ontology at all -- which only ever happens on a real, full production ontology release (an OAEI-curated evaluation ontology always declares the property, even on classes that don't use it). `bertmaplt_string.py` now calls `_get_ignored_class_index_safe()`, a thin wrapper that checks `onto.owl_annotation_properties` first and only delegates to the real `get_ignored_class_index()` when the annotation property is actually present -- a genom_pipeline-side workaround for an upstream deeponto docstring/implementation mismatch, not a deeponto patch.
+- **`judge`'s CUDA OOM on large batches**: `_score_batch()` previously called the judge model with no `logits_to_keep`, which (in the installed `transformers` version) defaults to computing logits for *every* sequence position, not just the last one -- `logits_to_keep=0` means "keep all positions", not "keep zero". This made each forward pass allocate a `[batch_size, seq_len, vocab_size]` logits tensor instead of `[batch_size, 1, vocab_size]`, and could OOM on long prompts/large batches even with plenty of GPU memory for the model itself. Fixed by passing `logits_to_keep=1` together with left-padding (`tokenizer.padding_side = "left"`, set in `_load_judge_model()`) and explicit `position_ids` computed from `attention_mask` -- `logits_to_keep`'s trailing slice only means "the last real token" if every row's last real token sits at the same physical index, which requires left padding; and left padding alone would silently corrupt RoPE position embeddings unless `position_ids` is derived explicitly (a plain `model()` forward call, unlike `.generate()`, does not auto-correct positions for left-padded input).
 
 ---
 
@@ -416,6 +433,10 @@ version above is the canonical, peer-reviewed reference.
 - `define.py`: batched definition generation (was one concept at a time); `define.py`/`judge.py`: incremental checkpointing so an interrupted run resumes instead of restarting; both now explicitly free GPU memory (`del` + `gc.collect()` + `torch.cuda.empty_cache()`) before returning.
 - Fixed a JPype/JVM native-signal-handling segfault that could occur when a JVM (started for DeepOnto) shares a process with CUDA (via `torch`).
 - Added `scripts/genom_stage_runner.py`, a per-stage/HPC-SLURM driver with an equivalent CLI-flags or `--config a_task.yaml` interface -- see [Running Stage-by-Stage on an HPC/SLURM Cluster](#running-stage-by-stage-on-an-hpcslurm-cluster).
+- `retrieve.py`: added `query_side` (`retrieve_config["query_side"]` / `--query_side`), so retrieve can be queried from `"tgt"` instead of the default `"src"` without changing the output CSV schema or breaking the exact matchers' `src_owl`/`tgt_owl` convention -- see [Making retrieve/judge scale with the smaller side](#making-retrievejudge-scale-with-the-smaller-side).
+- `retrieve.py`: added `query_side_auto`, which ignores `query_side` and always queries from whichever side (src/tgt) has fewer concepts -- recommended over pinning `query_side` manually when you don't already know which side of a task pair is larger.
+- Fixed `bertmaplt_string.py` crashing with `KeyError: Cannot retrieve unknown IRI: ...` when run against a real, full production ontology (e.g. the actual SNOMED-CT/FMA release) that lacks the OAEI Bio-ML `use_in_alignment` annotation property entirely (see [Notes](#notes)).
+- Fixed a `judge.py` CUDA out-of-memory on large batches/long prompts: `_score_batch()` now passes `logits_to_keep=1` (previously defaulted to computing logits for the entire sequence, not just the last token) together with left-padding and explicit `position_ids`, so the judge no longer allocates a full `[batch, seq_len, vocab]` logits tensor every forward pass (see [Notes](#notes)).
 
 ---
 
