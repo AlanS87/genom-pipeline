@@ -210,6 +210,57 @@ def test_extract_forwards_reasoner_type(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# run_stage: retrieve's query_side forwarding
+# ---------------------------------------------------------------------------
+
+def _patch_retrieve_run(monkeypatch, fake):
+    # Same attribute-shadowing gotcha as _patch_extract_run above:
+    # genom_pipeline/steps/__init__.py's `from .retrieve import run as
+    # retrieve` overwrites the package's `retrieve` attribute with the
+    # `run` function itself, so patch the real module object (resolved via
+    # import_module(), i.e. through sys.modules by dotted name) instead.
+    import importlib
+
+    retrieve_module = importlib.import_module("genom_pipeline.steps.retrieve")
+    monkeypatch.setattr(retrieve_module, "run", fake)
+
+
+def _retrieve_config(tmp_path, **overrides):
+    config = dict(stage_runner.DEFAULTS)
+    config.update({
+        "stage": "retrieve",
+        "workdir": str(tmp_path),
+        "_config_source": "cli",
+    })
+    config.update(overrides)
+    return config
+
+
+def test_retrieve_stage_forwards_query_side_default(tmp_path, monkeypatch):
+    calls = []
+    _patch_retrieve_run(
+        monkeypatch,
+        lambda **kw: calls.append(kw) or kw["output_candidates_csv"],
+    )
+
+    stage_runner.run_stage(_retrieve_config(tmp_path))
+
+    assert calls[0]["query_side"] == "src"
+
+
+def test_retrieve_stage_forwards_query_side_override(tmp_path, monkeypatch):
+    calls = []
+    _patch_retrieve_run(
+        monkeypatch,
+        lambda **kw: calls.append(kw) or kw["output_candidates_csv"],
+    )
+
+    stage_runner.run_stage(_retrieve_config(tmp_path, query_side="tgt"))
+
+    assert calls[0]["query_side"] == "tgt"
+
+
+# ---------------------------------------------------------------------------
 # CLI flags and YAML must resolve to the exact same run_stage() input
 # ---------------------------------------------------------------------------
 

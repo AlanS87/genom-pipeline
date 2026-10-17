@@ -106,6 +106,13 @@ DEFAULTS: Dict[str, Any] = {
     "domain": "general",
     "max_src_concepts": 0,
     "index_type": "hnsw",
+    # retrieve stage only -- which side's concepts drive the faiss
+    # nearest-neighbour search (see genom_pipeline/steps/retrieve.py's
+    # run() docstring). "src" (default) reproduces the original behaviour:
+    # the index is built over tgt embeddings and each src concept queries
+    # it. The output CSV's src_iri/tgt_iri/score/rank columns keep the
+    # same meaning regardless of this setting.
+    "query_side": "src",
     "fuse_strategy": "exact_priority",
     "fuse_llm_threshold": 0.9,
     "fuse_cs_threshold": 0.9,
@@ -362,9 +369,10 @@ def run_stage(config: Dict[str, Any]) -> str:
         from genom_pipeline.steps.retrieve import run as retrieve_run
 
         index_type = config.get("index_type", DEFAULTS["index_type"])
+        query_side = config.get("query_side", DEFAULTS["query_side"])
         _record_run_config(workdir, "retrieve", {
             "topk": topk, "overwrite": overwrite, "index_type": index_type,
-            "_config_source": config_source,
+            "query_side": query_side, "_config_source": config_source,
         })
 
         result = retrieve_run(
@@ -373,6 +381,7 @@ def run_stage(config: Dict[str, Any]) -> str:
             topk=topk,
             overwrite=overwrite,
             index_type=index_type,
+            query_side=query_side,
         )
         print(f"[retrieve] -> {result}")
         return result
@@ -481,6 +490,10 @@ def main() -> None:
 
     # retrieve stage
     p.add_argument("--index_type", default=DEFAULTS["index_type"], choices=["flatip", "ivf", "hnsw"], help="retrieve stage only")
+    p.add_argument("--query_side", default=DEFAULTS["query_side"], choices=["src", "tgt"],
+                    help="retrieve stage only: which side's concepts drive the faiss nearest-neighbour "
+                         "search (default: src, the original behaviour). Output CSV columns keep the "
+                         "same src_iri/tgt_iri meaning either way -- see retrieve.py's run() docstring.")
 
     # fusion stage
     p.add_argument("--fuse_strategy", default=DEFAULTS["fuse_strategy"], choices=["union", "exact_priority", "llm_then_exact_fill"])
@@ -552,6 +565,7 @@ def main() -> None:
             "domain": args.domain,
             "max_src_concepts": args.max_src_concepts,
             "index_type": args.index_type,
+            "query_side": args.query_side,
             "fuse_strategy": args.fuse_strategy,
             "fuse_llm_threshold": args.fuse_llm_threshold,
             "fuse_cs_threshold": args.fuse_cs_threshold,

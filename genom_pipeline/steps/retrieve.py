@@ -128,15 +128,18 @@ def run(
     normalize: bool = True,
     index_type: str = "hnsw",
     index_params: Optional[Dict[str, Any]] = None,
+    query_side: str = "src",
 ) -> str:
     """
-    Step 4: retrieve top-k candidates for each src concept based on embeddings.
+    Step 4: retrieve top-k candidates based on embeddings.
 
     Input
       store_pt_path: concept_store.pt with store["src"][iri][embedding_field] and store["tgt"][iri][embedding_field]
 
     Output CSV schema
-      src_iri, tgt_iri, score, rank
+      src_iri, tgt_iri, score, rank -- ALWAYS in this canonical sense
+      regardless of query_side (see below), so judge.py/fusion.py/the exact
+      matchers never need to change.
 
     index_type
       "flatip"  exact inner product on GPU or CPU
@@ -148,12 +151,31 @@ def run(
       gpu_id: int default 0
       ivf: nlist, nprobe
       hnsw: m, ef_construction, ef_search
+
+    query_side
+      "src" (default) -- original behaviour: the faiss index is built over
+        tgt embeddings, and each src concept queries it for its topk
+        nearest tgt neighbours.
+      "tgt" -- the faiss index is built over src embeddings instead, and
+        each tgt concept queries it for its topk nearest src neighbours.
+      Either way the output CSV's columns keep the same src_iri/tgt_iri/
+      score/rank meaning -- only which side drives the nearest-neighbour
+      search changes. This is deliberate: a naive src/tgt ontology swap
+      would also flip the direction fuse_config["exact"]["config"]'s
+      src_owl/tgt_owl need to point in, silently breaking fusion.py's
+      exact-priority dedup logic. query_side changes only retrieve's
+      internal search direction, never the final output convention.
+      The value actually used is recorded in
+      store["meta"]["retrieve_query_side"].
     """
     out_path = Path(output_candidates_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if out_path.exists() and not overwrite:
         return str(out_path)
+
+    if query_side not in ("src", "tgt"):
+        raise ValueError(f"query_side must be 'src' or 'tgt', got {query_side!r}")
 
     index_params = index_params or {}
     use_gpu = bool(index_params.get("use_gpu", False))
@@ -177,22 +199,31 @@ def run(
         src_mat = _l2_normalize(src_mat)
         tgt_mat = _l2_normalize(tgt_mat)
 
-    dim = tgt_mat.shape[1]
-    index = _build_faiss_index(dim, index_type=index_type, tgt_mat=tgt_mat, use_gpu=use_gpu, index_params=index_params)
+    if query_side == "src":
+        query_iris, query_mat = src_iris, src_mat
+        match_iris, match_mat = tgt_iris, tgt_mat
+    else:
+        query_iris, query_mat = tgt_iris, tgt_mat
+        match_iris, match_mat = src_iris, src_mat
+
+    dim = match_mat.shape[1]
+    index = _build_faiss_index(dim, index_type=index_type, tgt_mat=match_mat, use_gpu=use_gpu, index_params=index_params)
 
     k = int(topk)
-    scores, idx = index.search(src_mat, k)
+    scores, idx = index.search(query_mat, k)
 
     rows: List[Dict[str, Any]] = []
-    for i, src_iri in enumerate(src_iris):
+    for i, query_iri in enumerate(query_iris):
         for r in range(k):
             j = int(idx[i, r])
-            if j < 0 or j >= len(tgt_iris):
+            if j < 0 or j >= len(match_iris):
                 continue
+            match_iri = match_iris[j]
+            src_iri, tgt_iri = (query_iri, match_iri) if query_side == "src" else (match_iri, query_iri)
             rows.append(
                 {
                     "src_iri": src_iri,
-                    "tgt_iri": tgt_iris[j],
+                    "tgt_iri": tgt_iri,
                     "score": float(scores[i, r]),
                     "rank": int(r + 1),
                 }
@@ -208,6 +239,7 @@ def run(
     store["meta"]["retrieve_embedding_field"] = embedding_field
     store["meta"]["retrieve_normalize"] = normalize
     store["meta"]["retrieve_index_params"] = dict(index_params)
+    store["meta"]["retrieve_query_side"] = query_side
 
     torch.save(store, store_pt_path)
 
