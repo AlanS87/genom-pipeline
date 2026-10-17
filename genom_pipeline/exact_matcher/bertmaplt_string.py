@@ -20,6 +20,42 @@ from textdistance import levenshtein
 
 MappingTuple = Tuple[str, str, float]
 
+# The OAEI Bio-ML evaluation ontologies annotate some classes with this
+# property to say whether they should be scored ("use_in_alignment"); only
+# the officially OAEI-curated ontologies carry it -- a real, full
+# production ontology release (e.g. the real SNOMED-CT or FMA, not an
+# OAEI Bio-ML-trimmed copy of them) never does.
+_OAEI_USE_IN_ALIGNMENT_IRI = "http://oaei.ontologymatching.org/bio-ml/ann/use_in_alignment"
+
+
+def _get_ignored_class_index_safe(onto: "Ontology") -> Set[str]:
+    """
+    Same as deeponto.align.oaei.get_ignored_class_index(onto), except it
+    first checks whether `onto` actually declares the OAEI
+    "use_in_alignment" annotation property before delegating to it.
+
+    get_ignored_class_index() calls Ontology.get_annotations(class_obj,
+    _OAEI_USE_IN_ALIGNMENT_IRI) for every class in `onto`. get_annotations()'s
+    own docstring promises an empty return when the annotation property IRI
+    doesn't exist in the ontology -- but the real implementation (via
+    get_owl_object()) raises `KeyError: Cannot retrieve unknown IRI: ...`
+    instead, a genuine docstring/implementation mismatch in the installed
+    deeponto version. This only ever manifests on a real, full production
+    ontology (no OAEI "use_in_alignment" annotations at all) -- every
+    OAEI Bio-ML evaluation ontology genuinely declares the property (even
+    if few/no classes use it), so this never fired during OAEI-only testing.
+
+    Fixed here, in our own wrapper, rather than by patching deeponto itself
+    (unlike genom_pipeline/_deeponto_compat.py's DataHasValue patch, which
+    changes deeponto's behaviour for every caller) -- there's no "patch
+    get_annotations to actually honour its own docstring" that wouldn't
+    also risk changing behaviour deeponto callers outside genom_pipeline
+    rely on.
+    """
+    if _OAEI_USE_IN_ALIGNMENT_IRI not in onto.owl_annotation_properties:
+        return set()
+    return get_ignored_class_index(onto)
+
 
 def _edit_similarity_mapping_score(
     src_class_annotations: Set[str],
@@ -87,8 +123,8 @@ class BERTMapLtStringMatcher:
                 if prelim > 0.0:
                     mappings.append(_init_class_mapping(src_iri, tgt_iri, prelim))
 
-        ignored = get_ignored_class_index(src_onto)
-        ignored.update(get_ignored_class_index(tgt_onto))
+        ignored = _get_ignored_class_index_safe(src_onto)
+        ignored.update(_get_ignored_class_index_safe(tgt_onto))
         mappings = remove_ignored_mappings(mappings, ignored)
 
         return [m.to_tuple(with_score=True) for m in mappings]
