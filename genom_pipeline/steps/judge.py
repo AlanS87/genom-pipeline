@@ -44,6 +44,16 @@ def _load_judge_model(model_name: str, hf_token: Optional[str], torch_dtype: str
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Required for _score_batch()'s logits_to_keep=1 optimisation below to
+    # be correct, not just fast: logits_to_keep=1 only returns "the last
+    # real token's logits" if every row's last real token sits at the same
+    # physical (last) index in the batch, which needs LEFT padding -- the
+    # tokenizer default (right padding) puts each row's last real token at
+    # a different index per row, which a single trailing slice can't
+    # express. See _score_batch()'s docstring for the matching
+    # position_ids fix left padding also requires.
+    tokenizer.padding_side = "left"
+
     model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
     model.eval()
     torch.set_grad_enabled(False)
@@ -130,14 +140,57 @@ def _build_pair_prompt(
 
 
 def _score_batch(judge: HFYesNoJudge, prompts: List[str]) -> List[float]:
+    """
+    Score one batch of prompts, reading only the final token's logits
+    (the YES/NO decision token) from each.
+
+    BUG FIX (CUDA OOM on large batches/long prompts): a plain
+    `judge.model(**inputs)` call defaults `logits_to_keep` to 0, which in
+    the installed transformers version means "keep ALL positions" (the
+    slice `slice(-logits_to_keep, None)` with `logits_to_keep=0` is
+    `slice(0, None)`, i.e. the whole sequence) -- not "keep zero", despite
+    the name. That makes every forward pass materialize a
+    `[batch_size, seq_len, vocab_size]` logits tensor when only the single
+    last-token slice `[batch_size, 1, vocab_size]` is ever read afterwards
+    -- for a large vocab and long prompt this tensor alone can be tens of
+    GiB and OOM the GPU even though the model itself fits comfortably.
+
+    Passing `logits_to_keep=1` fixes that allocation, but is only
+    *correct* (not just faster) when every row's real last token sits at
+    the same physical (last) index in the batch -- which requires LEFT
+    padding (`_load_judge_model()` sets `tokenizer.padding_side = "left"`)
+    instead of the tokenizer's right-padding default, where each row's
+    real last token sits at a different index per row and a single
+    trailing slice can't express "the last real token" for all of them at
+    once.
+
+    Left padding on its own would then silently corrupt results: RoPE
+    position embeddings are derived from each token's position in the
+    sequence, and a raw `model()` forward call (unlike `.generate()`) does
+    NOT auto-correct positions for left-padded input -- every pad token
+    would be counted as a real position, shifting every real token's
+    effective position by however many pad tokens precede it. Passing
+    `position_ids` explicitly, computed the standard way from
+    `attention_mask`, keeps every real token's position correct
+    regardless of how much left padding precedes it:
+        position_ids = attention_mask.cumsum(-1) - 1   # 0, 1, 2, ... over real tokens
+        position_ids[attention_mask == 0] = 1          # pad positions: value is irrelevant,
+                                                         # masked out by attention_mask anyway
+    """
     inputs = judge.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(judge.model.device)
 
-    with (torch.inference_mode() if hasattr(torch, "inference_mode") else torch.no_grad()):
-        logits = judge.model(**inputs).logits
+    attention_mask = inputs["attention_mask"]
+    position_ids = attention_mask.long().cumsum(-1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 1)
 
-    attn = inputs["attention_mask"]
-    last_index = attn.sum(dim=1) - 1
-    logits_last = logits[torch.arange(logits.size(0)), last_index]
+    with (torch.inference_mode() if hasattr(torch, "inference_mode") else torch.no_grad()):
+        logits = judge.model(**inputs, position_ids=position_ids, logits_to_keep=1).logits
+
+    # logits_to_keep=1 already sliced the sequence dimension down to the
+    # single last physical position (correct for every row, thanks to
+    # left padding above) -- no per-row attention_mask.sum() indexing
+    # needed any more.
+    logits_last = logits[:, -1, :]
     probs = logits_last.softmax(dim=-1)
 
     yes_p = probs[:, judge.yes_ids].sum(dim=1) if judge.yes_ids else torch.zeros(probs.size(0), device=probs.device)
