@@ -260,6 +260,30 @@ def test_retrieve_stage_forwards_query_side_override(tmp_path, monkeypatch):
     assert calls[0]["query_side"] == "tgt"
 
 
+def test_retrieve_stage_forwards_query_side_auto_default(tmp_path, monkeypatch):
+    calls = []
+    _patch_retrieve_run(
+        monkeypatch,
+        lambda **kw: calls.append(kw) or kw["output_candidates_csv"],
+    )
+
+    stage_runner.run_stage(_retrieve_config(tmp_path))
+
+    assert calls[0]["query_side_auto"] is False
+
+
+def test_retrieve_stage_forwards_query_side_auto_override(tmp_path, monkeypatch):
+    calls = []
+    _patch_retrieve_run(
+        monkeypatch,
+        lambda **kw: calls.append(kw) or kw["output_candidates_csv"],
+    )
+
+    stage_runner.run_stage(_retrieve_config(tmp_path, query_side_auto=True))
+
+    assert calls[0]["query_side_auto"] is True
+
+
 # ---------------------------------------------------------------------------
 # CLI flags and YAML must resolve to the exact same run_stage() input
 # ---------------------------------------------------------------------------

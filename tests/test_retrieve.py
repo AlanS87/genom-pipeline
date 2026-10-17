@@ -157,3 +157,79 @@ def test_query_side_invalid_value_raises(tmp_path, asym_store_pt_path):
             overwrite=True,
             query_side="bogus",
         )
+
+
+# ---------------------------------------------------------------------------
+# query_side_auto: ignores the literal query_side and always queries from
+# whichever side has fewer concepts.
+# ---------------------------------------------------------------------------
+
+_MANY_SRC = {
+    "s0": {"embedding": _unit(0.0)},
+    "s1": {"embedding": _unit(40.0)},
+    "s2": {"embedding": _unit(80.0)},
+}
+_FEW_TGT = {
+    "t0": {"embedding": _unit(15.0)},
+}
+
+
+@pytest.fixture
+def skewed_store_pt_path(tmp_path):
+    p = tmp_path / "skewed_concept_store.pt"
+    torch.save({"src": dict(_MANY_SRC), "tgt": dict(_FEW_TGT)}, p)
+    return str(p)
+
+
+def test_query_side_auto_off_keeps_literal_query_side(tmp_path, skewed_store_pt_path):
+    out_csv = str(tmp_path / "candidates.csv")
+    retrieve_run(
+        store_pt_path=skewed_store_pt_path,
+        output_candidates_csv=out_csv,
+        topk=1,
+        overwrite=True,
+        query_side="tgt",
+        query_side_auto=False,
+    )
+    df = pd.read_csv(out_csv)
+    # query_side="tgt" taken literally: one row per tgt concept (there's only 1)
+    assert len(df) == 1
+
+    store = torch.load(skewed_store_pt_path)
+    assert store["meta"]["retrieve_query_side"] == "tgt"
+    assert store["meta"]["retrieve_query_side_auto"] is False
+
+
+def test_query_side_auto_on_picks_the_smaller_side_and_overrides_literal_query_side(tmp_path, skewed_store_pt_path):
+    out_csv = str(tmp_path / "candidates.csv")
+    retrieve_run(
+        store_pt_path=skewed_store_pt_path,
+        output_candidates_csv=out_csv,
+        topk=1,
+        overwrite=True,
+        query_side="src",  # ignored because query_side_auto=True
+        query_side_auto=True,
+    )
+    df = pd.read_csv(out_csv)
+    # tgt (1 concept) is smaller than src (3 concepts) -- auto must query
+    # from tgt regardless of the literal query_side="src" passed in, so
+    # there's one row per tgt concept, not per src concept.
+    assert len(df) == 1
+
+    store = torch.load(skewed_store_pt_path)
+    assert store["meta"]["retrieve_query_side"] == "tgt"
+    assert store["meta"]["retrieve_query_side_auto"] is True
+
+
+def test_query_side_auto_ties_keep_src(tmp_path, asym_store_pt_path):
+    # _ASYM_SRC and _ASYM_TGT both have 2 concepts -- a tie must keep "src".
+    out_csv = str(tmp_path / "candidates.csv")
+    retrieve_run(
+        store_pt_path=asym_store_pt_path,
+        output_candidates_csv=out_csv,
+        topk=1,
+        overwrite=True,
+        query_side_auto=True,
+    )
+    store = torch.load(asym_store_pt_path)
+    assert store["meta"]["retrieve_query_side"] == "src"

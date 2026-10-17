@@ -113,6 +113,14 @@ DEFAULTS: Dict[str, Any] = {
     # it. The output CSV's src_iri/tgt_iri/score/rank columns keep the
     # same meaning regardless of this setting.
     "query_side": "src",
+    # retrieve stage only -- when True, query_side above is ignored and
+    # retrieve.run() instead measures which side (src/tgt) has fewer
+    # concepts and always queries from that smaller side (a tie keeps
+    # "src"), so the faiss index is always built over the larger side.
+    # This only changes retrieve's internal search direction; the final
+    # output src_iri/tgt_iri convention and every later stage are
+    # unaffected either way.
+    "query_side_auto": False,
     "fuse_strategy": "exact_priority",
     "fuse_llm_threshold": 0.9,
     "fuse_cs_threshold": 0.9,
@@ -175,6 +183,7 @@ def load_yaml_config(config_path: str, stage: str) -> Dict[str, Any]:
 
         retrieve:
           index_type: flatip
+          query_side_auto: true
 
         fusion:
           fuse_strategy: exact_priority
@@ -370,9 +379,11 @@ def run_stage(config: Dict[str, Any]) -> str:
 
         index_type = config.get("index_type", DEFAULTS["index_type"])
         query_side = config.get("query_side", DEFAULTS["query_side"])
+        query_side_auto = bool(config.get("query_side_auto", DEFAULTS["query_side_auto"]))
         _record_run_config(workdir, "retrieve", {
             "topk": topk, "overwrite": overwrite, "index_type": index_type,
-            "query_side": query_side, "_config_source": config_source,
+            "query_side": query_side, "query_side_auto": query_side_auto,
+            "_config_source": config_source,
         })
 
         result = retrieve_run(
@@ -382,6 +393,7 @@ def run_stage(config: Dict[str, Any]) -> str:
             overwrite=overwrite,
             index_type=index_type,
             query_side=query_side,
+            query_side_auto=query_side_auto,
         )
         print(f"[retrieve] -> {result}")
         return result
@@ -492,8 +504,15 @@ def main() -> None:
     p.add_argument("--index_type", default=DEFAULTS["index_type"], choices=["flatip", "ivf", "hnsw"], help="retrieve stage only")
     p.add_argument("--query_side", default=DEFAULTS["query_side"], choices=["src", "tgt"],
                     help="retrieve stage only: which side's concepts drive the faiss nearest-neighbour "
-                         "search (default: src, the original behaviour). Output CSV columns keep the "
-                         "same src_iri/tgt_iri meaning either way -- see retrieve.py's run() docstring.")
+                         "search (default: src, the original behaviour). Ignored if --query_side_auto "
+                         "is set. Output CSV columns keep the same src_iri/tgt_iri meaning either way "
+                         "-- see retrieve.py's run() docstring.")
+    p.add_argument("--query_side_auto", dest="query_side_auto", action="store_true", default=DEFAULTS["query_side_auto"],
+                    help="retrieve stage only: ignore --query_side and always query from whichever side "
+                         "(src/tgt) has fewer concepts, so the faiss index is built over the larger side "
+                         "(default: off)")
+    p.add_argument("--no_query_side_auto", dest="query_side_auto", action="store_false",
+                    help="(default) take --query_side literally instead of auto-picking the smaller side")
 
     # fusion stage
     p.add_argument("--fuse_strategy", default=DEFAULTS["fuse_strategy"], choices=["union", "exact_priority", "llm_then_exact_fill"])
@@ -566,6 +585,7 @@ def main() -> None:
             "max_src_concepts": args.max_src_concepts,
             "index_type": args.index_type,
             "query_side": args.query_side,
+            "query_side_auto": args.query_side_auto,
             "fuse_strategy": args.fuse_strategy,
             "fuse_llm_threshold": args.fuse_llm_threshold,
             "fuse_cs_threshold": args.fuse_cs_threshold,

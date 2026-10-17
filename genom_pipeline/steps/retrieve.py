@@ -129,6 +129,7 @@ def run(
     index_type: str = "hnsw",
     index_params: Optional[Dict[str, Any]] = None,
     query_side: str = "src",
+    query_side_auto: bool = False,
 ) -> str:
     """
     Step 4: retrieve top-k candidates based on embeddings.
@@ -165,7 +166,24 @@ def run(
       src_owl/tgt_owl need to point in, silently breaking fusion.py's
       exact-priority dedup logic. query_side changes only retrieve's
       internal search direction, never the final output convention.
-      The value actually used is recorded in
+      The resolved value actually used (not necessarily the literal value
+      passed in -- see query_side_auto) is recorded in
+      store["meta"]["retrieve_query_side"].
+
+    query_side_auto
+      False (default) -- query_side is taken literally, as described above.
+      True -- query_side is IGNORED, and this function instead measures
+        len(src concepts) vs len(tgt concepts) itself and always queries
+        from whichever side has fewer concepts (a tie keeps "src"), so the
+        faiss index is always built over the LARGER side. This only
+        affects which side drives retrieve's internal search (and
+        therefore candidate generation) -- the final output src_iri/
+        tgt_iri convention, and every later stage (judge/fusion/exact
+        matchers), is completely unaffected and still follows the input
+        src ontology as usual.
+      Whether this was on is recorded in
+      store["meta"]["retrieve_query_side_auto"]; the side actually chosen
+      (whether by this or taken literally from query_side) is always in
       store["meta"]["retrieve_query_side"].
     """
     out_path = Path(output_candidates_csv)
@@ -174,7 +192,7 @@ def run(
     if out_path.exists() and not overwrite:
         return str(out_path)
 
-    if query_side not in ("src", "tgt"):
+    if not query_side_auto and query_side not in ("src", "tgt"):
         raise ValueError(f"query_side must be 'src' or 'tgt', got {query_side!r}")
 
     index_params = index_params or {}
@@ -199,7 +217,12 @@ def run(
         src_mat = _l2_normalize(src_mat)
         tgt_mat = _l2_normalize(tgt_mat)
 
-    if query_side == "src":
+    if query_side_auto:
+        effective_query_side = "src" if len(src_iris) <= len(tgt_iris) else "tgt"
+    else:
+        effective_query_side = query_side
+
+    if effective_query_side == "src":
         query_iris, query_mat = src_iris, src_mat
         match_iris, match_mat = tgt_iris, tgt_mat
     else:
@@ -219,7 +242,7 @@ def run(
             if j < 0 or j >= len(match_iris):
                 continue
             match_iri = match_iris[j]
-            src_iri, tgt_iri = (query_iri, match_iri) if query_side == "src" else (match_iri, query_iri)
+            src_iri, tgt_iri = (query_iri, match_iri) if effective_query_side == "src" else (match_iri, query_iri)
             rows.append(
                 {
                     "src_iri": src_iri,
@@ -239,7 +262,8 @@ def run(
     store["meta"]["retrieve_embedding_field"] = embedding_field
     store["meta"]["retrieve_normalize"] = normalize
     store["meta"]["retrieve_index_params"] = dict(index_params)
-    store["meta"]["retrieve_query_side"] = query_side
+    store["meta"]["retrieve_query_side"] = effective_query_side
+    store["meta"]["retrieve_query_side_auto"] = query_side_auto
 
     torch.save(store, store_pt_path)
 
